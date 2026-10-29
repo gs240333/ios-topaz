@@ -12,12 +12,12 @@
 #include "loader.h"
 #include "ufs.h"
 
-#define IMEM_RESTART_REASON	0x0c12565cUL	/* qcom,msm-imem@c125000 restart_reason@65c */
+#define IMEM_RESTART_REASON	0x146bf65cUL	/* qcom,msm-imem@146bf000 restart_reason@65c */
 #define RESTART_BOOTLOADER	0x77665500U
-#define PSHOLD			0x0440b000UL
+#define PSHOLD			0x10ac000UL
 
-#define GICD_BASE		0x0f200000UL
-#define GICR_BASE		0x0f300000UL
+#define GICD_BASE		0x17a00000UL
+#define GICR_BASE		0x17b00000UL
 #define GICR_SIZE		0x100000UL
 #define GICR_PE_SIZE		0x20000UL
 #define GICR_TYPER		0x08
@@ -59,7 +59,7 @@ static inline void wr8(uintptr_t a, uint8_t v) { *(volatile uint8_t *)a = v; }
 extern char secondary_entry[];
 
 static const char *stage;	/* set at runtime: no absolute pointers in data */
-/* topaz: CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 */
+/* wayne: CPU0-3 (A53) at MPIDR 0x0-0x3, CPU4-7 (A73) at 0x100-0x103 (same as topaz) */
 static inline uint64_t cpu_mpidr(int i) { return (uint64_t)(i >> 2) << 8 | (i & 3); }
 
 static volatile uint64_t sec_mpidr[NR_CPUS];
@@ -241,28 +241,15 @@ static uint64_t speed_ticks(void)
 }
 
 /*
- * Gold cluster to its top cpufreq-hw level before xnu (which has no cpufreq
- * driver): freq-domain1 0xf523000, LUT +0x110 (32-byte rows), PERF_STATE +0x920.
+ * wayne: the Gold cluster clock runs on the OSM (qcom,clk-cpu-osm @0x179c0000),
+ * not topaz's cpufreq-hw LUT. Program it only once the OSM registers are
+ * understood; for now ABL leaves it at a sane boot frequency and xnu has no
+ * cpufreq driver, so booting slower is fine. Report the perfcl PLL status.
  */
 static void gold_cpufreq_max(void)
 {
-	uintptr_t b = 0x0f523000;
-	uint32_t best = 0, best_khz = 0, prev = 0;
-	for (uint32_t i = 0; i < 12; i++) {
-		uint32_t v = rd32(b + 0x110 + i * 0x20);
-		uint32_t khz = ((v >> 30) & 3) ? 19200 * (v & 0xff) : 300000;
-		if (i && khz == prev)
-			break;
-		prev = khz;
-		if (khz > best_khz) {
-			best_khz = khz;
-			best = i;
-		}
-	}
-	uint32_t old = rd32(b + 0x920);
-	wr32(b + 0x920, best);
-	__asm__ volatile("dsb sy" ::: "memory");
-	con_hex2("CPUFREQ", "old=", old, "mhz=", best_khz / 1000);
+	uint32_t l = rd32(0x17816004);	/* perfcl L-val */
+	con_hex2("CPUFREQ", "osm-l=", l, "note=", 1);
 }
 
 static void __attribute__((noreturn)) gold_main(uint64_t dtb)
@@ -532,9 +519,9 @@ void shim_main(uint64_t dtb)
 	con_str("LOADER", why);
 	con_skip();
 
-	/* No payload: probe the internal UFS while the MMU is still off. */
+	/* wayne has no UFS (eMMC phone): skip the probe, it would read unmapped MMIO. */
 	stage = "ufs";
-	test_ufs();
+	con_str("UFS", "wayne is eMMC: probe skipped, driver is future work");
 	con_skip();
 	/* Keep the probe results on screen (later tests clear it); reset after 3 min. */
 	con_str("UFS", "probe done, reset in ~3 min");

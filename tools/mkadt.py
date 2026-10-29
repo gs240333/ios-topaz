@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Build the minimal Apple Device Tree that the TOPAZ xnu needs to boot.
+"""Build the minimal Apple Device Tree that the WAYNE xnu needs to boot.
 
 Only what the early boot path actually reads (see NOTES.md); every MMIO
-address comes from the topaz (Redmi Note 12 4G, SM6225 khaje) live FDT. Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem]
+address comes from the wayne (Xiaomi Mi 6X, SDM660) stock boot DTB.
+Usage:  mkadt.py OUT.adt [--dump] [--qemu] [--highmem] [--midmem] [--native]
 """
 import hashlib, os, struct, sys
 
@@ -16,32 +17,36 @@ MEM_SIZE = 0x4d000000
 # node is <0x40000000 0x3bb00000>, <0x80000000 3G>, <0x1_40000000 4G>; every
 # fixed reserved-memory carve-out is below 0x63900000 and the dynamic pools are
 # limited below 4G.
-HIGH_PHYS_BASE = 0x140000000
-HIGH_MEM_SIZE = 0x100000000
-# --midmem (phone only): the middle and upper banks as one range, 0x80000000 +
-# 3G + 4G = 7G up to 0x2_40000000. No fixed carve-out is above 0x63900000, and it
-# gives the kernel RAM below 4 GiB, which the GPU needs (it does not reach above).
+# wayne (4G variant, stock boot DTB): banks <0x80000000 0x80000000> and
+# <0x1_00000000 0x7e4c0000> -- one contiguous range 0x80000000..0x1fe4c0000.
+HIGH_PHYS_BASE = 0x100000000
+HIGH_MEM_SIZE = 0x7e4c0000
+# --midmem (phone only): both banks as one range, 0x80000000 + 2G + ~2G up to
+# 0x1fe4c0000. Gives the kernel RAM below 4 GiB, which the MDP scanout needs
+# (the framebuffer lives at 0x9d400000 in the lower bank).
 MID_PHYS_BASE = int(__import__("os").environ.get("MIDBASE", "0x80000000"), 16)
-MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0x1c0000000"), 16)
+MID_MEM_SIZE = int(__import__("os").environ.get("MIDSIZE", "0xfe4c0000"), 16)
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
-# interrupt-controller@f200000 (redistributor-stride 0x20000, 8 cores)
-GICD, GICD_SIZE = 0x0f200000, 0x10000
-GICR, GICR_SIZE = 0x0f300000, 0x100000
-# cont_splash_region left lit by ABL
-FB, FB_SIZE = 0x5c000000, 0xf00000
-SWEET_ECID = 0x544f50415a000001  # 'TOPAZ' + 1, synthetic
-FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
-# Internal UFS host (ufshc@4804000 "ufs_mem"); QEMU virt has none
-UFS, UFS_SIZE = 0x04804000, 0x3000
+# wayne (Xiaomi Mi 6X, SDM660): interrupt-controller@17a00000 in the stock
+# boot DTB; redistributor-stride 0x20000 (wayne0.dts).
+GICD, GICD_SIZE = 0x17a00000, 0x10000
+GICR, GICR_SIZE = 0x17b00000, 0x100000
+# cont_splash_region left lit by ABL: splash_region@9d400000 (0x2400000).
+FB, FB_SIZE = 0x9d400000, 0x2400000
+SWEET_ECID = 0x5741594e45000001  # 'WAYNE' + 1, synthetic
+FB_W, FB_H, FB_STRIDE = 1080, 2160, 1080 * 4
+# Storage is eMMC (sdhc1 sdhci@c0c4000, sdhci-msm-v5); XNU has an SDHCI driver
+# as future work, so no storage node yet -- first boots run from a RAM disk.
+STORAGE, STORAGE_SIZE = 0x0c0c4000, 0x3000
 TIMEBASE = 19200000
 VTIMER_INTID = 19
 # QEMU virt (-M virt,gic-version=3 -cpu cortex-a76): GICD/GICR and the generic timer's CNTFRQ
 QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE = 0x08000000, 0x080a0000, 62500000
 QEMU_VTIMER_INTID = 27
 
-BOOT_MANIFEST_HASH = hashlib.sha384(b'topaz boot manifest').digest()
+BOOT_MANIFEST_HASH = hashlib.sha384(b'wayne boot manifest').digest()
 
 # The iOS userland is the iPhone X (iPhone10,3 / D22AP) IPSW. MobileGestalt
 # derives product type, device class, home-button-less UI, artwork etc. from
@@ -91,8 +96,8 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('dram-size', u64(mem_size)),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
-        ('firmware-version', cstr('topaz-shim')),
-        ('system-firmware-version', cstr('topaz-shim')),
+        ('firmware-version', cstr('wayne-shim')),
+        ('system-firmware-version', cstr('wayne-shim')),
         # iBoot's SHA-384 of the boot manifest; /sbin/mount -P 1 exits unless
         # it exists (bind mounts /private/preboot/<hex>/usr/standalone/firmware,
         # tolerating a missing directory). Fixed stand-in value.
@@ -149,7 +154,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
             ('l3-cache-id', u32(0)),
             ('state', cstr('running' if core == 0 else 'stopped')),
             ('timebase-frequency', u32(timebase)),
-            ('clock-frequency', u32(2803200000)),
+            ('clock-frequency', u32(2208000000)),  # wayne Gold max (OSM speedbin0)
             ('bus-frequency', u32(100000000)),
             ('memory-frequency', u32(1866000000)),
             ('peripheral-frequency', u32(timebase)),
@@ -186,7 +191,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         node('wlan', [
             ph(),
             ('device_type', cstr('wlan')),
-            ('compatible', cstr('topaz,wcn3988')),
+            ('compatible', cstr('wayne,wcn3990')),
         ]),
         node('disp0', [
             ph(),
@@ -207,12 +212,9 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('stride', u32(FB_STRIDE)),
     ])
 
-    # bsd/dev/sweet_ufs.c: the UFS host ABL leaves running (absolute physical reg).
-    ufs = node('sweet-ufs', [
-        ph(),
-        ('compatible', cstr('qcom,ufshc')),
-        ('reg', u64(UFS, UFS_SIZE)),
-    ])
+    # wayne: storage is eMMC (sdhc1 @0xc0c4000, sdhci-msm-v5). The XNU side has
+    # no SDHCI driver yet, so no storage node at all: boot from a RAM disk
+    # (mkpayload.py --ramdisk, rd=md0) until the driver lands.
 
     # pmap_compute_max_asids requires the node even when no overrides are set.
     # An absent pmap-max-asids property selects XNU's own MAX_ASIDS default.
@@ -239,18 +241,18 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
-    # (iPhone10,3). 'xiaomi,sweet' and qcom,kryo470 stay because the
+    # (iPhone10,3). 'xiaomi,wayne' and qcom,kryo260 stay because the
     # SweetPlatformExpert and CPU IONameMatch still use them.
     return node('device-tree', [
         ph(),
-        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,topaz') + cstr('xiaomi,sweet') + cstr('qcom,khaje') + cstr('AppleARM')),
+        ('compatible', cstr('D22AP') + cstr('iPhone10,3') + cstr('xiaomi,wayne') + cstr('xiaomi,sweet') + cstr('qcom,sdm660') + cstr('AppleARM')),
         ('model', cstr('iPhone10,3')),
         ('target-type', cstr('D22')),
         ('target-sub-type', cstr('D22AP')),
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product)
 
 
 if __name__ == '__main__':
