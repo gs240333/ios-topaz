@@ -43,15 +43,15 @@ fi
 # Ramdisk: payload travels embedded in the Image; keep a small empty newc
 # cpio for the ABL's boot ramdisk (some ABLs dislike zero-size ramdisks).
 (cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
-# The sdm660 ABL scans the boot image's kernel blob for a DTB (stock kernels
-# and TWRP both carry one; without it the ABL refuses to jump). Ship the
-# stock wayne DTB extracted from backup/boot.img, then finalise image_size.
+# The sdm660 ABL only jumps kernels whose blob starts with a gzip stream
+# (stock kernels and TWRP are Image.gz+DTB; a raw arm64 Image is accepted by
+# fastboot but never executed). Wrap the Image in gzip exactly like the stock
+# boot.img layout, append the stock wayne DTB after the stream.
 DTB=${WAYNE_DTB:-../../wayne-boot/wayne0.dtb}
 [ -f "$DTB" ] || { echo "missing DTB: $DTB" >&2; exit 1; }
-truncate -s $(( ( $(stat -c%s out/Image) + 0xfff ) & ~0xfff )) out/Image
-cat "$DTB" >> out/Image
-python3 -c 'import os,struct,sys; f=open(sys.argv[1],"r+b"); f.seek(16); f.write(struct.pack("<Q", os.path.getsize(sys.argv[1])))' out/Image
-python3 ../pack_boot.py --kernel out/Image --ramdisk out/ramdisk.bin \
+gzip -9 -c out/Image > out/Image.gz
+cat out/Image.gz "$DTB" > out/blob.bin
+python3 ../pack_boot.py --kernel out/blob.bin --ramdisk out/ramdisk.bin \
 	--cmdline "console=null" -o out/shim-boot.img
 # Host render of the console layout.
 gcc -O1 -Wall -o out/host_test console.c host_test.c && ./out/host_test

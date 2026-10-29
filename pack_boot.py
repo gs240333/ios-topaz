@@ -7,7 +7,7 @@ v1/2048/0x10008000, but the shim now ships with a DTB appended and the
 TWRP-style header is the one verified to jump on this ABL.
 Verify with tools/unpack_bootv2.py.
 """
-import argparse, struct
+import argparse, hashlib, struct
 
 PAGE = 4096
 
@@ -32,10 +32,13 @@ hdr[0:8] = b'ANDROID!'
 struct.pack_into('<10I', hdr, 8,
                  len(k), 0x8000,		# kernel_size, kernel_addr (TWRP-style)
                  len(r), 0x1000000,		# ramdisk_size, ramdisk_addr
-                 0, 0,			# second_size, second_addr
+                 0, 0xf00000,		# second_size, second_addr (as TWRP)
                  0x100, PAGE,		# tags_addr, page_size
                  0, int(a.os_version, 16))	# header_version 0, os_version
 hdr[64:64 + len(a.cmdline)] = a.cmdline.encode()	# cmdline field (512B) @64
+# id @576: SHA1 over kernel+ramdisk+second -- this ABL verifies it
+# ("Failed to load/authenticate boot image: 00000050" when zeroed).
+hdr[576:596] = hashlib.sha1(k + r).digest()
 
 with open(a.out, 'wb') as f:
     f.write(hdr)
