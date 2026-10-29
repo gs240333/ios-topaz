@@ -12,10 +12,10 @@ index c2864ab..7941def 100644
  bsd/dev/redwood_apple80211.c	standard
 diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
 new file mode 100644
-index 0000000..a8b2c59
+index 0000000..95365ab
 --- /dev/null
 +++ b/bsd/dev/sweet_emmc.c
-@@ -0,0 +1,519 @@
+@@ -0,0 +1,554 @@
 +/*
 + * SWEET internal eMMC root device (read-only), for the Xiaomi Mi 6X (wayne).
 + *
@@ -146,10 +146,22 @@ index 0000000..a8b2c59
 +	su.r16[off / 2] = x;
 +}
 +
++/* Wall-clock deadline, so a dead controller bus cannot spin for minutes. */
++static uint64_t
++em_deadline(uint64_t ns)
++{
++	uint64_t ticks = 0;
++
++	nanoseconds_to_absolutetime(ns, &ticks);
++	return mach_absolute_time() + ticks;
++}
++
 +static int
 +em_wait_nis(uint16_t bit)
 +{
-+	for (uint32_t i = 0; i < CMD_POLLS; i++) {
++	uint64_t deadline = em_deadline(5ull * NSEC_PER_SEC);
++
++	for (;;) {
 +		uint16_t s = em_rd16(SD_NIST);
 +		if (s & NIS_ERR) {
 +			return EIO;
@@ -157,19 +169,27 @@ index 0000000..a8b2c59
 +		if (s & bit) {
 +			return 0;
 +		}
++		if (mach_absolute_time() > deadline) {
++			return ETIMEDOUT;
++		}
++		delay(10);
 +	}
-+	return ETIMEDOUT;
 +}
 +
 +/* Software reset of the data (bit 2) and command (bit 1) lines. */
 +static void
 +emmc_reset_lines(void)
 +{
++	uint64_t deadline = em_deadline(NSEC_PER_SEC);
++
 +	em_wr8(SD_SW_RESET, (1u << 2));
-+	for (uint32_t i = 0; i < CMD_POLLS && em_rd8(SD_SW_RESET); i++) {
++	while ((em_rd8(SD_SW_RESET) & (1u << 2)) && mach_absolute_time() < deadline) {
++		delay(10);
 +	}
++	deadline = em_deadline(NSEC_PER_SEC);
 +	em_wr8(SD_SW_RESET, (1u << 1));
-+	for (uint32_t i = 0; i < CMD_POLLS && em_rd8(SD_SW_RESET); i++) {
++	while ((em_rd8(SD_SW_RESET) & (1u << 1)) && mach_absolute_time() < deadline) {
++		delay(10);
 +	}
 +	em_wr16(SD_NIST, NIS_CLEAR);
 +}
@@ -200,7 +220,8 @@ index 0000000..a8b2c59
 +		em_wr16(SD_NIST, NIS_CMD_DONE);
 +		uint32_t *p = (uint32_t *)vaddr;
 +		for (uint32_t b = 0; b < count && !error; b++) {
-+			for (uint32_t i = 0; i < CMD_POLLS; i++) {
++			uint64_t deadline = em_deadline(NSEC_PER_SEC);
++			for (;;) {
 +				if (em_rd32(SD_PSTATE) & PS_BUF_RD_EN) {
 +					break;
 +				}
@@ -208,6 +229,11 @@ index 0000000..a8b2c59
 +					error = EIO;
 +					break;
 +				}
++				if (mach_absolute_time() > deadline) {
++					error = ETIMEDOUT;
++					break;
++				}
++				delay(10);
 +			}
 +			if (error) {
 +				break;
@@ -478,24 +504,33 @@ index 0000000..a8b2c59
 +	char want[64] = "userdata";
 +	int error;
 +
-+	if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess ||
-+	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
-+	    size < 2 * sizeof(uintptr_t)) {
++	printf("SWEET eMMC: init start (rd=%s)\n", want);
++	if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess) {
 +		printf("SWEET eMMC: no /sweet-emmc node in the device tree\n");
 +		return ENXIO;
 +	}
++	if (SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET eMMC: /sweet-emmc has no usable reg property\n");
++		return ENXIO;
++	}
 +	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++	printf("SWEET eMMC: reg 0x%llx size 0x%llx, want \"%s\"\n",
++	    (uint64_t)reg[0], (uint64_t)reg[1], want);
 +
 +	su.r16 = (volatile uint16_t *)ml_io_map(reg[0], reg[1]);
 +	su.secsize = DEV_BSIZE;
++	printf("SWEET eMMC: mapped at 0x%llx, reading caps\n", (uint64_t)su.r16);
 +
 +	lck_mtx_lock(&sweet_emmc_lock);
 +	error = emmc_take_over_host();
 +	if (!error) {
++		printf("SWEET eMMC: host taken over, reading GPT\n");
 +		error = emmc_find_partition(want);
 +	}
 +	lck_mtx_unlock(&sweet_emmc_lock);
 +	if (error) {
++		printf("SWEET eMMC: init failed, error %d\n", error);
 +		return error;
 +	}
 +
