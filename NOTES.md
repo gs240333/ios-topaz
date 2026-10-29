@@ -1,5 +1,31 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## WAYNE handoff (2026-10-29, Xiaomi Mi 6X port) -- read first
+
+Port of this project to the Xiaomi Mi 6X (wayne, SDM660), temporary
+`fastboot boot` only. Everything below the next heading is the upstream
+sweet (SM7150) log, kept as the template reference.
+
+- XNU (xnu-8796 + patch chain, CI gs240333/ios-topaz workflow `xnu`) boots
+  on the phone: 4/4 gold CPUs, GICv3, VM up, userland services launched.
+  Boot: shim (`shim/`) packed as boot image v1 with a gzip kernel blob
+  (ABL only jumps gzip) + stock DTB appended; the xnu payload rides the
+  ramdisk channel (wayne ABL loads the kernel blob at 0x80000000, so it
+  cannot be embedded); the ramdisk lands at 0x83400000.
+- Storage is eMMC (sdhc_1, sdhci-msm-v5 @0x0c0c4000, standard SDHCI
+  registers, hc_irq SPI 110): patch `xnu/patches/0153-sweet-emmc-root-device.patch`
+  adds the polled PIO read-only root device `emmcroot0` (CMD18 +
+  auto-CMD12, GPT partition by name, boot-arg `emmcroot=`, default
+  userdata), wired in IOKitBSDInit.cpp next to the 0028 ufsroot0 hook; the
+  ADT node `/sweet-emmc` comes from `tools/mkadt.py`.
+- Rootfs: iOS 16.7.16 (20H392, D22AP) dmg images unpacked on the aarch64
+  build box (192.168.1.5, `ssh -p 9922 root@...`). `tools/mkiosroot.sh`
+  must run under **bash** (busybox sh chokes on arrays); apfs-fuse needed
+  musl fixes (pread64->pread, stat64->stat, fstat64->fstat).
+- Next: CI kernel with 0153, mkpayload with `rd=emmcroot0`, flash
+  sweet-root.img to userdata (confirm with the user first, destructive),
+  boot.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<

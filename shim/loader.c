@@ -134,9 +134,21 @@ const char *loader_boot(uintptr_t dtb)
 	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
 	con_hex("VIRT", p->virt_base);
 	con_hex("ENTRY", p->entry_va);
+	con_hex2("HDR", "adt_off=", p->adt_off, "adt_size=", p->adt_size);
 
-	/* The payload must not overlap where the kernel goes. */
-	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)
+	/*
+	 * The payload must not overlap the kernel's actual footprint
+	 * (segments + ADT + boot_args page). Checking against the whole RAM
+	 * region was wrong: the wayne ABL loads the ramdisk high (inside the
+	 * RAM region, but above the kernel image), which always tripped the
+	 * old check. The full 64-bit values go through con_hex -- con_hex2
+	 * prints 32-bit fields only.
+	 */
+	uintptr_t top_pa = ((p->kernel_end + pa_of_va_base + p->adt_size + PAGE_16K - 1)
+			    & ~(PAGE_16K - 1)) + PAGE_16K;
+	con_hex2("KTOP", "lo=", top_pa, "rd_end=", rd_end);
+	con_hex("RDHI", rd_end);
+	if (rd_end > p->phys_base && rd_start < top_pa)
 		return "ramdisk overlaps kernel memory";
 
 	for (uint32_t i = 0; i < p->nsegs; i++) {

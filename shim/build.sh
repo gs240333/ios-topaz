@@ -34,15 +34,16 @@ size=$((16#$($NM out/shim.elf | awk '$3=="_end"{print $1}')))
 truncate -s "$size" out/Image
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
+# wayne: the ABL loads the kernel blob at 0x80000000 -- exactly where the
+# ADT's kernel RAM starts (--midmem), so the payload cannot ride behind the
+# Image (loader.c: "ramdisk overlaps kernel memory"). Ship it as the boot
+# image ramdisk instead: the ABL loads it at 0x03400000 and publishes
+# linux,initrd-start/end in the DTB /chosen for loader.c to find.
 if [ -n "${1:-}" ]; then
-	# Append the payload to the Image at the first 4K boundary after _end
-	# (loader.c) and grow image_size.
-	truncate -s $(( (size + 0xfff) & ~0xfff )) out/Image
-	cat "$1" >> out/Image
+	cp "$1" out/ramdisk.bin
+else
+	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
-# Ramdisk: payload travels embedded in the Image; keep a small empty newc
-# cpio for the ABL's boot ramdisk (some ABLs dislike zero-size ramdisks).
-(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 # The sdm660 ABL only jumps kernels whose blob starts with a gzip stream
 # (stock kernels and TWRP are Image.gz+DTB; a raw arm64 Image is accepted by
 # fastboot but never executed). Wrap the Image in gzip exactly like the stock

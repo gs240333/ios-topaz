@@ -239,6 +239,14 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         product_props = [(k, cstr('sRGB') if k == 'artwork-display-gamut' else v) for k, v in product_props]
     product = [node('product', [ph()] + product_props)] if product_props else []
 
+    # The eMMC root device (bsd/dev/sweet_emmc.c): sdhc_1 hc_mem of the
+    # qcom,sdhci-msm-v5 controller, left card-initialised by the bootloader.
+    emmc = node('sweet-emmc', [
+        ph(),
+        ('compatible', cstr('sweet-emmc')),
+        ('reg', u64(STORAGE, STORAGE_SIZE)),
+    ])
+
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
     # (iPhone10,3). 'xiaomi,wayne' and qcom,kryo260 stay because the
@@ -252,7 +260,7 @@ def build(seed=None, qemu=False, highmem=False, native=False, midmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product)
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons, emmc] + product)
 
 
 if __name__ == '__main__':

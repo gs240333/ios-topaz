@@ -1,0 +1,566 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c2864ab..7941def 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -105,6 +105,7 @@ bsd/dev/random/randomdev.c		standard
+ 
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
++bsd/dev/sweet_emmc.c			standard
+ bsd/dev/redwood_sta.c		standard
+ bsd/dev/redwood_net.c		standard
+ bsd/dev/redwood_apple80211.c	standard
+diff --git a/bsd/dev/sweet_emmc.c b/bsd/dev/sweet_emmc.c
+new file mode 100644
+index 0000000..a8b2c59
+--- /dev/null
++++ b/bsd/dev/sweet_emmc.c
+@@ -0,0 +1,519 @@
++/*
++ * SWEET internal eMMC root device (read-only), for the Xiaomi Mi 6X (wayne).
++ *
++ * The Qualcomm SDHCI (sdhci-msm-v5, sdhc_1) is left enabled with the card
++ * initialised by the bootloader, which loaded our boot image from it. This
++ * driver reuses that state: it masks all interrupt signals and issues
++ * polled commands (CMD18 multiple-block reads with auto-CMD12, PIO data),
++ * one at a time. It finds one GPT partition by name (boot-arg emmcroot=,
++ * default "userdata") and exposes it as the BSD disk emmcroot0
++ * (remmcroot0). Root on it with rd=emmcroot0.
++ *
++ * All data is moved by the CPU through the SDHCI PIO buffer, so no DMA and
++ * no cache maintenance is involved.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <kern/kalloc.h>
++#include <kern/clock.h>
++#include <machine/machine_routines.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++
++/* SDHCI standard register offsets (hc_mem). */
++#define SD_BLK_SIZE     0x04            /* 16-bit */
++#define SD_BLK_COUNT    0x06            /* 16-bit */
++#define SD_ARGUMENT     0x08            /* 32-bit */
++#define SD_XFER_MODE    0x0c            /* 16-bit */
++#define SD_COMMAND      0x0e            /* 16-bit */
++#define SD_BUFFER       0x20            /* 32-bit PIO port */
++#define SD_PSTATE       0x24            /* 32-bit */
++#define SD_CLKCTL       0x2c            /* 16-bit */
++#define SD_SW_RESET     0x2f            /* 8-bit */
++#define SD_NIST         0x30            /* 16-bit normal int status */
++#define SD_EIST         0x32            /* 16-bit error int status */
++#define SD_NIST_EN      0x34
++#define SD_EIST_EN      0x36
++#define SD_NSIG_EN      0x38
++#define SD_ESIG_EN      0x3a
++#define SD_CAPS         0x40            /* 32-bit */
++
++#define NIS_CMD_DONE    (1u << 0)
++#define NIS_XFER_DONE   (1u << 1)
++#define NIS_BUF_RD      (1u << 5)
++#define NIS_ERR         (1u << 15)
++#define NIS_CLEAR       0xffffu
++
++#define PS_CMD_INH      (1u << 0)
++#define PS_DAT_INH      (1u << 1)
++#define PS_BUF_RD_EN    (1u << 11)
++
++/* Command register fields. */
++#define CMD_IDX(n)      ((n) << 8)
++#define CMD_RESP_R1     1u              /* 48-bit response */
++#define CMD_CRC         (1u << 2)
++#define CMD_IDXCHK      (1u << 3)
++#define CMD_DATA        (1u << 4)
++/* Transfer mode fields. */
++#define XM_BLKCNT       (1u << 1)
++#define XM_AUTOCMD12    (1u << 2)
++#define XM_READ         (1u << 3)
++#define XM_MULTI        (1u << 4)
++
++#define SECT_SIZE       512u
++#define MAX_BURST       512u            /* blocks per CMD18 */
++#define CMD_POLLS       200000000u
++
++static LCK_GRP_DECLARE(sweet_emmc_grp, "sweet_emmc");
++static LCK_MTX_DECLARE(sweet_emmc_lock, &sweet_emmc_grp);
++
++static struct {
++	volatile uint16_t *r16;
++	uint64_t first_block, nblocks;
++	dev_t bdev;
++	int bmajor, cmajor;
++	unsigned secsize;
++	bool ready;
++} su;
++
++static inline uint32_t
++em_rd32(uint32_t off)
++{
++	return *(volatile uint32_t *)((volatile char *)su.r16 + off);
++}
++
++static inline uint16_t
++em_rd16(uint32_t off)
++{
++	return su.r16[off / 2];
++}
++
++static inline uint8_t
++em_rd8(uint32_t off)
++{
++	return (uint8_t)(su.r16[off / 2] >> ((off & 1) * 8));
++}
++
++static inline void
++em_wr32(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)((volatile char *)su.r16 + off) = v;
++}
++
++static inline void
++em_wr16(uint32_t off, uint16_t v)
++{
++	su.r16[off / 2] = v;
++}
++
++static inline void
++em_wr8(uint32_t off, uint8_t v)
++{
++	uint16_t x = su.r16[off / 2];
++	x = (uint16_t)((x & ~(0xffu << ((off & 1) * 8))) | ((uint16_t)v << ((off & 1) * 8)));
++	su.r16[off / 2] = x;
++}
++
++static int
++em_wait_nis(uint16_t bit)
++{
++	for (uint32_t i = 0; i < CMD_POLLS; i++) {
++		uint16_t s = em_rd16(SD_NIST);
++		if (s & NIS_ERR) {
++			return EIO;
++		}
++		if (s & bit) {
++			return 0;
++		}
++	}
++	return ETIMEDOUT;
++}
++
++/* Software reset of the data (bit 2) and command (bit 1) lines. */
++static void
++emmc_reset_lines(void)
++{
++	em_wr8(SD_SW_RESET, (1u << 2));
++	for (uint32_t i = 0; i < CMD_POLLS && em_rd8(SD_SW_RESET); i++) {
++	}
++	em_wr8(SD_SW_RESET, (1u << 1));
++	for (uint32_t i = 0; i < CMD_POLLS && em_rd8(SD_SW_RESET); i++) {
++	}
++	em_wr16(SD_NIST, NIS_CLEAR);
++}
++
++/*
++ * CMD18: READ_MULTIPLE_BLOCK with auto-CMD12, PIO. High-capacity eMMC
++ * addressing: the argument is the LBA (byte addressing only applies to
++ * cards <= 2 GiB, which wayne's is not).
++ */
++static int
++emmc_read_blocks(uint64_t lba, uint32_t count, void *vaddr)
++{
++	int error;
++
++	if (count == 0 || count > MAX_BURST) {
++		return EINVAL;
++	}
++	em_wr16(SD_NIST, NIS_CLEAR);
++	em_wr16(SD_EIST, 0xffffu);
++
++	em_wr16(SD_BLK_SIZE, SECT_SIZE);
++	em_wr16(SD_BLK_COUNT, count);
++	em_wr32(SD_ARGUMENT, (uint32_t)lba);
++	em_wr16(SD_XFER_MODE, XM_MULTI | XM_BLKCNT | XM_AUTOCMD12 | XM_READ);
++	em_wr16(SD_COMMAND, CMD_IDX(18) | CMD_RESP_R1 | CMD_CRC | CMD_IDXCHK | CMD_DATA);
++
++	if ((error = em_wait_nis(NIS_CMD_DONE)) == 0) {
++		em_wr16(SD_NIST, NIS_CMD_DONE);
++		uint32_t *p = (uint32_t *)vaddr;
++		for (uint32_t b = 0; b < count && !error; b++) {
++			for (uint32_t i = 0; i < CMD_POLLS; i++) {
++				if (em_rd32(SD_PSTATE) & PS_BUF_RD_EN) {
++					break;
++				}
++				if (em_rd16(SD_NIST) & NIS_ERR) {
++					error = EIO;
++					break;
++				}
++			}
++			if (error) {
++				break;
++			}
++			for (uint32_t i = 0; i < SECT_SIZE / 4; i++) {
++				*p++ = em_rd32(SD_BUFFER);
++			}
++			em_wr16(SD_NIST, NIS_BUF_RD);
++		}
++	}
++	if (!error) {
++		error = em_wait_nis(NIS_XFER_DONE);
++		em_wr16(SD_NIST, NIS_XFER_DONE);
++	}
++	if (error) {
++		uint16_t e = em_rd16(SD_EIST);
++		if (e) {
++			printf("SWEET eMMC: error status 0x%x at lba %llu\n", e, lba);
++		}
++		emmc_reset_lines();
++	}
++	return error;
++}
++
++static int
++emmc_take_over_host(void)
++{
++	uint32_t caps = em_rd32(SD_CAPS);
++
++	if (caps == 0 || caps == 0xffffffffu) {
++		printf("SWEET eMMC: host registers dead (caps 0x%x)\n", caps);
++		return ENXIO;
++	}
++	em_wr16(SD_NSIG_EN, 0);                     /* no IRQ lines */
++	em_wr16(SD_ESIG_EN, 0);
++	em_wr16(SD_NIST_EN, 0xffffu);               /* but status updates on */
++	em_wr16(SD_EIST_EN, 0xffffu);
++	if (em_rd32(SD_PSTATE) & (PS_CMD_INH | PS_DAT_INH)) {
++		printf("SWEET eMMC: cmd/data inhibited, pstate 0x%x\n", em_rd32(SD_PSTATE));
++	}
++	printf("SWEET eMMC: caps 0x%x clkctl 0x%x pstate 0x%x\n",
++	    caps, em_rd16(SD_CLKCTL), em_rd32(SD_PSTATE));
++	return 0;
++}
++
++static int
++emmc_find_partition(const char *want)
++{
++	uint8_t *b = (uint8_t *)kalloc_data(4096, Z_WAITOK | Z_ZERO);
++	int error = ENXIO;
++
++	if (!b) {
++		return ENOMEM;
++	}
++	if ((error = emmc_read_blocks(1, 1, b)) == 0 && memcmp(b, "EFI PART", 8) != 0) {
++		printf("SWEET eMMC: no GPT at LBA 1 (sig %.8s)\n", (const char *)b);
++		error = ENXIO;
++	}
++	if (!error) {
++		uint32_t entry_lba = b[216] | (b[217] << 8) | (b[218] << 16) |
++		    ((uint32_t)b[219] << 24);
++		uint32_t nent = b[80] | (b[81] << 8) | (b[82] << 16) |
++		    ((uint32_t)b[83] << 24);
++		uint32_t esz = b[84] | (b[85] << 8) | (b[86] << 16) |
++		    ((uint32_t)b[87] << 24);
++		uint32_t per = SECT_SIZE / esz;
++		for (uint32_t i = 0; i < nent && error; i += per) {
++			uint32_t lba = entry_lba + i / per;
++			uint32_t cnt = MIN(per, nent - i);
++			if ((error = emmc_read_blocks(lba, cnt, b)) != 0) {
++				break;
++			}
++			for (uint32_t j = 0; j < cnt; j++) {
++				uint8_t *e = b + j * esz;
++				if (e[0] == 0) {
++					continue;           /* unused entry */
++				}
++				if (strcmp((const char *)e + 56, want) == 0) {
++					memcpy(&su.first_block, e + 32, 8);
++					memcpy(&su.nblocks, e + 40, 8);
++					error = 0;
++					i = nent;
++					break;
++				}
++			}
++		}
++	}
++	if (error == 0) {
++		printf("SWEET eMMC: \"%s\" first block 0x%llx, %llu blocks\n",
++		    want, su.first_block, su.nblocks);
++	}
++	kfree_data(b, 4096);
++	return error;
++}
++
++static int
++sweet_emmc_open(__unused dev_t dev, int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	if (!su.ready) {
++		return ENXIO;
++	}
++	return (flags & FWRITE) ? EROFS : 0;
++}
++
++static int
++sweet_emmc_close(__unused dev_t dev, __unused int flags, __unused int devtype,
++    __unused struct proc *p)
++{
++	return 0;
++}
++
++static void
++sweet_emmc_strategy(buf_t bp)
++{
++	int error = 0;
++	caddr_t vaddr = NULL;
++	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
++	uint32_t count = buf_count(bp);
++	uint64_t part_bytes = su.nblocks * SECT_SIZE;
++
++	buf_setresid(bp, count);
++	if (!(buf_flags(bp) & B_READ)) {
++		error = EROFS;
++		goto done;
++	}
++	if (off > part_bytes || count > part_bytes - off) {
++		error = EINVAL;
++		goto done;
++	}
++	if (count == 0) {
++		goto done;
++	}
++	if (buf_map(bp, &vaddr)) {
++		error = EIO;
++		goto done;
++	}
++
++	lck_mtx_lock(&sweet_emmc_lock);
++	for (uint32_t done = 0; done < count && !error;) {
++		uint32_t blocks = (uint32_t)MIN((count - done) / su.secsize,
++		    (uint64_t)MAX_BURST);
++		if (blocks == 0) {
++			break;
++		}
++		error = emmc_read_blocks((off + done) / SECT_SIZE, blocks,
++		    vaddr + done);
++		done += blocks * su.secsize;
++		buf_setresid(bp, count - done);
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	buf_unmap(bp);
++
++done:
++	if (error) {
++		buf_seterror(bp, error);
++	}
++	buf_biodone(bp);
++}
++
++static int
++sweet_emmc_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
++    __unused struct proc *p, int is_char)
++{
++	uint32_t *f = (uint32_t *)data;
++	uint64_t *o = (uint64_t *)data;
++
++	switch (cmd) {
++	case DKIOCGETBLOCKSIZE:
++		*f = su.secsize;
++		return 0;
++	case DKIOCSETBLOCKSIZE:
++		if (is_char) {
++			return ENODEV;
++		}
++		if (*f < DEV_BSIZE || *f > SECT_SIZE || (*f & (*f - 1))) {
++			return EINVAL;
++		}
++		su.secsize = *f;
++		return 0;
++	case DKIOCGETPHYSICALBLOCKSIZE:
++		*f = SECT_SIZE;
++		return 0;
++	case DKIOCGETBLOCKCOUNT:
++		*o = su.nblocks * SECT_SIZE / su.secsize;
++		return 0;
++	case DKIOCISWRITABLE:
++		*f = 0;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTREAD:
++		*o = MAX_BURST;
++		return 0;
++	case DKIOCGETMAXBLOCKCOUNTWRITE:
++		*o = 0;
++		return 0;
++	case DKIOCGETMAXSEGMENTCOUNTREAD:
++	case DKIOCGETMAXSEGMENTCOUNTWRITE:
++		*o = 1;
++		return 0;
++	default:
++		return ENOTTY;
++	}
++}
++
++static int
++sweet_emmc_bioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_emmc_ioctl(dev, cmd, data, flag, p, 0);
++}
++
++static int
++sweet_emmc_cioctl(dev_t dev, u_long cmd, caddr_t data, int flag, struct proc *p)
++{
++	return sweet_emmc_ioctl(dev, cmd, data, flag, p, 1);
++}
++
++static int
++sweet_emmc_psize(__unused dev_t dev)
++{
++	return su.ready ? (int)MIN(su.nblocks * SECT_SIZE / su.secsize, INT_MAX) : -1;
++}
++
++static int
++sweet_emmc_read(dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	return physio(sweet_emmc_strategy, NULL, dev, B_READ, minphys, uio, (int)su.secsize);
++}
++
++static int
++sweet_emmc_write(__unused dev_t dev, __unused struct uio *uio, __unused int ioflag)
++{
++	return EROFS;
++}
++
++static const struct bdevsw sweet_emmc_bdevsw = {
++	.d_open     = sweet_emmc_open,
++	.d_close    = sweet_emmc_close,
++	.d_strategy = sweet_emmc_strategy,
++	.d_ioctl    = sweet_emmc_bioctl,
++	.d_dump     = eno_dump,
++	.d_psize    = sweet_emmc_psize,
++	.d_type     = D_DISK,
++};
++
++static const struct cdevsw sweet_emmc_cdevsw = {
++	.d_open       = sweet_emmc_open,
++	.d_close      = sweet_emmc_close,
++	.d_read       = sweet_emmc_read,
++	.d_write      = sweet_emmc_write,
++	.d_ioctl      = sweet_emmc_cioctl,
++	.d_stop       = eno_stop,
++	.d_reset      = eno_reset,
++	.d_ttys       = NULL,
++	.d_select     = eno_select,
++	.d_mmap       = eno_mmap,
++	.d_strategy   = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type       = D_DISK,
++};
++
++static int
++sweet_emmc_init(void)
++{
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	char want[64] = "userdata";
++	int error;
++
++	if (SecureDTLookupEntry(NULL, "/sweet-emmc", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET eMMC: no /sweet-emmc node in the device tree\n");
++		return ENXIO;
++	}
++	PE_parse_boot_argn("emmcroot", want, sizeof(want));
++
++	su.r16 = (volatile uint16_t *)ml_io_map(reg[0], reg[1]);
++	su.secsize = DEV_BSIZE;
++
++	lck_mtx_lock(&sweet_emmc_lock);
++	error = emmc_take_over_host();
++	if (!error) {
++		error = emmc_find_partition(want);
++	}
++	lck_mtx_unlock(&sweet_emmc_lock);
++	if (error) {
++		return error;
++	}
++
++	su.bmajor = bdevsw_add(-1, &sweet_emmc_bdevsw);
++	if (su.bmajor < 0) {
++		return ENXIO;
++	}
++	su.cmajor = cdevsw_add_with_bdev(-1, &sweet_emmc_cdevsw, su.bmajor);
++	if (su.cmajor < 0) {
++		return ENXIO;
++	}
++	su.bdev = makedev(su.bmajor, 0);
++	devfs_make_node(su.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
++	    "emmcroot0");
++	devfs_make_node(makedev(su.cmajor, 0), DEVFS_CHAR, UID_ROOT, GID_OPERATOR,
++	    0640, "remmcroot0");
++	su.ready = true;
++	printf("SWEET eMMC: \"%s\": first block 0x%llx, %llu MiB, read-only\n",
++	    want, su.first_block, su.nblocks >> 1);
++	return 0;
++}
++
++/* Root device for rd=emmcroot0 (IOFindBSDRoot). */
++int sweet_emmc_rootdev(dev_t *dev);
++
++int
++sweet_emmc_rootdev(dev_t *dev)
++{
++	if (!su.ready) {
++		int error = sweet_emmc_init();
++		if (error) {
++			return error;
++		}
++	}
++	*dev = su.bdev;
++	return 0;
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index e6c74aa..73cb9b4 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,6 +784,24 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	}
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++//
++//	SWEET: root on a GPT partition of the internal eMMC (bsd/dev/sweet_emmc.c)
++//
++	if (strcmp(rdBootVar, "emmcroot0") == 0) {
++		extern int sweet_emmc_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int emmc_error = sweet_emmc_rootdev(root);
++		if (emmc_error) {
++			panic("IOFindBSDRoot: SWEET eMMC root %s unavailable: %d", rdBootVar, emmc_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
++#endif
++
+ //
+ //	Now check if we are trying to root on a memory device
+ //
