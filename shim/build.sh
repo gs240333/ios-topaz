@@ -35,15 +35,22 @@ truncate -s "$size" out/Image
 # Ramdisk: an xnu payload (tools/mkpayload.py) if given as $1, else an empty
 # newc cpio (ABL dislikes a zero-size ramdisk on some builds) -> diagnostics.
 if [ -n "${1:-}" ]; then
-	# topaz ABL drops the v4 boot ramdisk: append the payload to the Image at
-	# the first 4K boundary after _end (loader.c) and grow image_size.
+	# Append the payload to the Image at the first 4K boundary after _end
+	# (loader.c) and grow image_size.
 	truncate -s $(( (size + 0xfff) & ~0xfff )) out/Image
 	cat "$1" >> out/Image
-	python3 -c 'import os,struct,sys; f=open(sys.argv[1],"r+b"); f.seek(16); f.write(struct.pack("<Q", os.path.getsize(sys.argv[1])))' out/Image
-	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
-else
-	(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
 fi
+# Ramdisk: payload travels embedded in the Image; keep a small empty newc
+# cpio for the ABL's boot ramdisk (some ABLs dislike zero-size ramdisks).
+(cd out && rm -rf rd && mkdir rd && cd rd && find . | cpio -o -H newc --quiet | gzip -9 > ../ramdisk.bin)
+# The sdm660 ABL scans the boot image's kernel blob for a DTB (stock kernels
+# and TWRP both carry one; without it the ABL refuses to jump). Ship the
+# stock wayne DTB extracted from backup/boot.img, then finalise image_size.
+DTB=${WAYNE_DTB:-../../wayne-boot/wayne0.dtb}
+[ -f "$DTB" ] || { echo "missing DTB: $DTB" >&2; exit 1; }
+truncate -s $(( ( $(stat -c%s out/Image) + 0xfff ) & ~0xfff )) out/Image
+cat "$DTB" >> out/Image
+python3 -c 'import os,struct,sys; f=open(sys.argv[1],"r+b"); f.seek(16); f.write(struct.pack("<Q", os.path.getsize(sys.argv[1])))' out/Image
 python3 ../pack_boot.py --kernel out/Image --ramdisk out/ramdisk.bin \
 	--cmdline "console=null" -o out/shim-boot.img
 # Host render of the console layout.
